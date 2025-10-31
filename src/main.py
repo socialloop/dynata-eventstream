@@ -30,42 +30,47 @@ CLOUD_FUNCTION_URL = os.environ.get('CLOUD_FUNCTION_URL', 'https://us-central1-l
 PORT = int(os.environ.get('PORT', '8080'))
 
 
-def get_dynata_signature(expiration: str, params: str) -> str:
+def get_dynata_signature(signing_string: str, access_key: str, secret_key: str, expiration: str) -> str:
     """
     Generate Dynata signature for authentication.
     
+    Per documentation: https://docs.rex.dynata.com/rex/security/
+    Steps:
+    1. HMAC-SHA256(expiration, signing_string)
+    2. HMAC-SHA256(access_key, first)
+    3. HMAC-SHA256(secret_key, second)
+    
     Args:
-        expiration: Expiration timestamp as string
-        params: Parameters string to sign
+        signing_string: The signing string (SHA256 hash of params for API requests)
+        access_key: The access key
+        secret_key: The secret key
+        expiration: Expiration timestamp as string (RFC 3339)
         
     Returns:
         Hexadecimal signature string
     """
-    # First hash: SHA256 of params
-    params_hash = hashlib.sha256(params.encode('utf-8')).hexdigest()
-    
-    # Second hash: HMAC-SHA256 with expiration as key and params_hash as message
-    hash1 = hmac.new(
+    # Step 1: HMAC-SHA256 with expiration as key and signing_string as message
+    first = hmac.new(
         expiration.encode('utf-8'),
-        params_hash.encode('utf-8'),
+        signing_string.encode('utf-8'),
         hashlib.sha256
     ).hexdigest()
     
-    # Third hash: HMAC-SHA256 with DYNATA_AUTH as key and hash1 as message
-    hash2 = hmac.new(
-        DYNATA_AUTH.encode('utf-8'),
-        hash1.encode('utf-8'),
+    # Step 2: HMAC-SHA256 with access_key as key and first as message
+    second = hmac.new(
+        access_key.encode('utf-8'),
+        first.encode('utf-8'),
         hashlib.sha256
     ).hexdigest()
     
-    # Final hash: HMAC-SHA256 with DYNATA_SECRET as key and hash2 as message
-    signature = hmac.new(
-        DYNATA_SECRET.encode('utf-8'),
-        hash2.encode('utf-8'),
+    # Step 3: HMAC-SHA256 with secret_key as key and second as message
+    final = hmac.new(
+        secret_key.encode('utf-8'),
+        second.encode('utf-8'),
         hashlib.sha256
     ).hexdigest()
     
-    return signature
+    return final
 
 
 def protobuf_to_dict(message):
@@ -196,11 +201,13 @@ def run():
     expiration_time = time.time() + 1000  # 1000 seconds from now (matching Node.js)
     expiration = datetime.fromtimestamp(expiration_time, tz=timezone.utc).isoformat()
     
-    # According to documentation: Use "respondent.events" as the signing string
-    params = "respondent.events"
+    # According to broadcaster documentation: Use "respondent.events" as the signing string
+    # Per security docs: For API requests, signing_string is SHA256 hash of the request body
+    # For the event stream, we use "respondent.events" as the literal string
+    signing_string = "respondent.events"
     
-    # Use ISO string expiration for signature (matches Node.js implementation)
-    signature = get_dynata_signature(expiration, params)
+    # Per security documentation: sign(signing_string, access_key, secret_key, expiration)
+    signature = get_dynata_signature(signing_string, DYNATA_AUTH, DYNATA_SECRET, expiration)
     
     # In Node.js, dynata-access-key uses DYNATA_AUTH
     # The access_key field should match what was used for signature creation
