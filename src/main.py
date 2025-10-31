@@ -191,15 +191,13 @@ def run():
     print(f"Cloud Function endpoint: {CLOUD_FUNCTION_URL}")
     
     # Generate authentication
-    # Dynata expects RFC 3339 format for expiration field, but signature uses Unix timestamp
+    # Dynata expects RFC 3339 format - use it for both expiration field and signature
     expiration_time = time.time() + 3600  # 1 hour from now
     expiration = datetime.fromtimestamp(expiration_time, tz=timezone.utc).isoformat()
-    expiration_timestamp = str(int(expiration_time))
     params = ""  # Adjust based on your actual params requirement
     
-    # Signature generation uses Unix timestamp string (as per original implementation)
-    # But expiration field in Auth message uses RFC 3339 format
-    signature = get_dynata_signature(expiration_timestamp, params)
+    # Use RFC 3339 format for signature generation to match what we send
+    signature = get_dynata_signature(expiration, params)
     access_key = DYNATA_ACCESS_KEY
     
     if not access_key:
