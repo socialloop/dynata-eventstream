@@ -201,12 +201,19 @@ def run():
     
     # Use ISO string expiration for signature (matches Node.js implementation)
     signature = get_dynata_signature(expiration, params)
-    access_key = DYNATA_ACCESS_KEY
+    
+    # In Node.js, dynata-access-key uses DYNATA_AUTH
+    # The access_key field should match what was used for signature creation
+    access_key = DYNATA_AUTH
     
     if not access_key:
-        raise ValueError("DYNATA_ACCESS_KEY environment variable must be set")
+        raise ValueError("DYNATA_AUTH environment variable must be set")
     
+    # Debug logging
     print(f"Generated signature for expiration: {expiration}")
+    print(f"Using access_key: {access_key[:10]}...")
+    print(f"Signature: {signature[:20]}...")
+    print(f"Params: {params}")
     
     # The service uses TLS, but does not require client-side certificate configuration
     credentials = grpc.ssl_channel_credentials(
