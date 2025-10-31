@@ -191,12 +191,16 @@ def run():
     print(f"Cloud Function endpoint: {CLOUD_FUNCTION_URL}")
     
     # Generate authentication
-    # Dynata expects RFC 3339 format - use it for both expiration field and signature
-    expiration_time = time.time() + 3600  # 1 hour from now
+    # Match the Node.js implementation: expiration is ISO string (RFC 3339)
+    # expiration = new Date((Timestamp.now().seconds + 1000) * 1000).toISOString()
+    expiration_time = time.time() + 1000  # 1000 seconds from now (matching Node.js)
     expiration = datetime.fromtimestamp(expiration_time, tz=timezone.utc).isoformat()
-    params = ""  # Adjust based on your actual params requirement
     
-    # Use RFC 3339 format for signature generation to match what we send
+    # For gRPC Listen call, params might be empty or the gRPC method path
+    # The signature algorithm uses expiration (ISO string) and params
+    params = ""  # Empty for gRPC calls (REST API uses JSON.stringify(body))
+    
+    # Use ISO string expiration for signature (matches Node.js implementation)
     signature = get_dynata_signature(expiration, params)
     access_key = DYNATA_ACCESS_KEY
     
