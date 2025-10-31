@@ -1,6 +1,5 @@
 grpcio==1.60.0
 grpcio-tools==1.60.0
-google-cloud-run==1.10.0
 protobuf==4.25.1
 requests==2.31.0
 

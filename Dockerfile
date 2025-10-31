@@ -23,5 +23,5 @@ RUN if [ -n "$(ls -A protos/*.proto 2>/dev/null)" ]; then \
 ENV PYTHONPATH=/app/src:${PYTHONPATH}
 
 # Run the service
-CMD ["python", "src/main.py"]
+CMD ["python3", "src/main.py"]
 
