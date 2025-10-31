@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package eventstream;
+
+service EventStream {
+  rpc Listen(Auth) returns (stream Event) {}
+}
+
+message Auth {
+  string expiration = 1;
+  string access_key = 2;
+  string signature = 3;
+}
+
+message Event {
+  message Start {
+    int64 group_id = 1;
+  }
+
+  message End {
+    string disposition = 1;
+    string status = 2;
+  }
+
+  string session = 1;
+  oneof data {
+    Start start = 2;
+    End end = 3;
+  }
+  string timestamp = 4;
+}
+
