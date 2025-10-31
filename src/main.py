@@ -220,7 +220,7 @@ def run():
     print(f"Generated signature for expiration: {expiration}")
     print(f"Using access_key: {access_key[:10]}...")
     print(f"Signature: {signature[:20]}...")
-    print(f"Params: {params}")
+    print(f"Signing string: {signing_string}")
     
     # The service uses TLS, but does not require client-side certificate configuration
     credentials = grpc.ssl_channel_credentials(
