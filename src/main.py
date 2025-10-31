@@ -196,9 +196,8 @@ def run():
     expiration_time = time.time() + 1000  # 1000 seconds from now (matching Node.js)
     expiration = datetime.fromtimestamp(expiration_time, tz=timezone.utc).isoformat()
     
-    # For gRPC Listen call, params might be empty or the gRPC method path
-    # The signature algorithm uses expiration (ISO string) and params
-    params = ""  # Empty for gRPC calls (REST API uses JSON.stringify(body))
+    # According to documentation: Use "respondent.events" as the signing string
+    params = "respondent.events"
     
     # Use ISO string expiration for signature (matches Node.js implementation)
     signature = get_dynata_signature(expiration, params)
