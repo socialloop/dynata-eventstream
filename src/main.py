@@ -2,7 +2,9 @@ import hashlib
 import hmac
 import os
 import time
-from datetime import datetime
+import threading
+from datetime import datetime, timezone
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import grpc
 import requests
 
@@ -23,6 +25,9 @@ DYNATA_ACCESS_KEY = os.environ.get('DYNATA_ACCESS_KEY', 'E2ABCF45339FB9E093384A7
 
 # Cloud Function endpoint
 CLOUD_FUNCTION_URL = os.environ.get('CLOUD_FUNCTION_URL', 'https://us-central1-lancelot-fa22c.cloudfunctions.net/dynataEvent')
+
+# Cloud Run port
+PORT = int(os.environ.get('PORT', '8080'))
 
 
 def get_dynata_signature(expiration: str, params: str) -> str:
@@ -156,6 +161,26 @@ def send_event_to_cloud_function(event):
         raise
 
 
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    """Simple HTTP handler for Cloud Run health checks"""
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b'OK')
+    
+    def log_message(self, format, *args):
+        # Suppress default logging
+        pass
+
+
+def start_health_server():
+    """Start HTTP server for Cloud Run health checks"""
+    server = HTTPServer(('', PORT), HealthCheckHandler)
+    print(f"Health check server listening on port {PORT}")
+    server.serve_forever()
+
+
 def run():
     """
     Main function to connect to Dynata event stream and process events.
@@ -165,11 +190,14 @@ def run():
     
     print(f"Cloud Function endpoint: {CLOUD_FUNCTION_URL}")
     
-    # Generate authentication
-    expiration = str(int(time.time()) + 3600)  # 1 hour from now
+    # Generate authentication with RFC 3339 timestamp
+    expiration_time = datetime.now(timezone.utc).timestamp() + 3600  # 1 hour from now
+    expiration = datetime.fromtimestamp(expiration_time, tz=timezone.utc).isoformat()
     params = ""  # Adjust based on your actual params requirement
     
-    signature = get_dynata_signature(expiration, params)
+    # For signature, we still use the Unix timestamp as string
+    expiration_timestamp = str(int(expiration_time))
+    signature = get_dynata_signature(expiration_timestamp, params)
     access_key = DYNATA_ACCESS_KEY
     
     if not access_key:
@@ -223,5 +251,10 @@ def run():
 
 
 if __name__ == '__main__':
+    # Start health check server in a separate thread
+    health_thread = threading.Thread(target=start_health_server, daemon=True)
+    health_thread.start()
+    
+    # Run the main event stream handler
     run()
 
