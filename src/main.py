@@ -195,9 +195,8 @@ def run():
     expiration = datetime.fromtimestamp(expiration_time, tz=timezone.utc).isoformat()
     params = ""  # Adjust based on your actual params requirement
     
-    # For signature, we still use the Unix timestamp as string
-    expiration_timestamp = str(int(expiration_time))
-    signature = get_dynata_signature(expiration_timestamp, params)
+    # Signature must use the same expiration value we send to Dynata
+    signature = get_dynata_signature(expiration, params)
     access_key = DYNATA_ACCESS_KEY
     
     if not access_key:
