@@ -65,18 +65,3 @@ gcloud run deploy dynata-eventstream \
     --set-env-vars DYNATA_AUTH=[value],DYNATA_SECRET=[value],DYNATA_ACCESS_KEY=[value] \
     --service-account [SERVICE-ACCOUNT-EMAIL]
 ```
-
-## Firestore Structure
-
-Events are saved to the collection specified by `FIRESTORE_COLLECTION` (default: `dynata_events`) with the following structure:
-
-- `session`: Session ID from the event
-- `event_timestamp`: Timestamp from the event message
-- `event_type`: Always "Event"
-- `event_subtype`: "Start" or "End" depending on the event data
-- `data_type`: "start" or "end" 
-- `start`: Object with `group_id` (for Start events)
-- `end`: Object with `disposition` and `status` (for End events)
-- `timestamp`: Firestore server timestamp
-- `received_at`: ISO format timestamp of when the event was received
-
