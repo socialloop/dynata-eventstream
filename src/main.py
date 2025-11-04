@@ -19,9 +19,10 @@ except ImportError:
     event_stream_pb2_grpc = None
 
 # Dynata authentication constants
-DYNATA_AUTH = os.environ.get('DYNATA_AUTH', 'E2ABCF45339FB9E093384A78E01A899F95BA3F22')
-DYNATA_SECRET = os.environ.get('DYNATA_SECRET', 'r54zNnhXqMtb6RkxWPX17R5ypp0HlDPL')
-DYNATA_ACCESS_KEY = os.environ.get('DYNATA_ACCESS_KEY', 'E2ABCF45339FB9E093384A78E01A899F95BA3F22')
+# Get env vars, handling empty strings by falling back to defaults
+DYNATA_AUTH = os.environ.get('DYNATA_AUTH') or 'E2ABCF45339FB9E093384A78E01A899F95BA3F22'
+DYNATA_SECRET = os.environ.get('DYNATA_SECRET') or 'r54zNnhXqMtb6RkxWPX17R5ypp0HlDPL'
+DYNATA_ACCESS_KEY = os.environ.get('DYNATA_ACCESS_KEY') or 'E2ABCF45339FB9E093384A78E01A899F95BA3F22'
 
 # Cloud Function endpoint
 CLOUD_FUNCTION_URL = os.environ.get('CLOUD_FUNCTION_URL', 'https://us-central1-lancelot-fa22c.cloudfunctions.net/dynataEvent')
@@ -194,9 +195,6 @@ def generate_auth():
     # In Node.js, dynata-access-key uses DYNATA_AUTH
     # The access_key field should match what was used for signature creation
     access_key = DYNATA_AUTH
-    
-    if not access_key:
-        raise ValueError("DYNATA_AUTH environment variable must be set")
     
     return expiration, access_key, signature
 
