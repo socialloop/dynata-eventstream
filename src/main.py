@@ -122,22 +122,6 @@ def send_event_to_cloud_function(event):
         # Convert event to dictionary
         event_dict = protobuf_to_dict(event)
         
-        # Determine event subtype from oneof data field
-        event_subtype = None
-        if hasattr(event, 'start') and event.HasField('start'):
-            event_subtype = 'Start'
-            event_dict['data_type'] = 'start'
-        elif hasattr(event, 'end') and event.HasField('end'):
-            event_subtype = 'End'
-            event_dict['data_type'] = 'end'
-        
-        # Add metadata
-        event_dict['event_type'] = 'Event'
-        event_dict['event_subtype'] = event_subtype
-        event_dict['session'] = event.session if hasattr(event, 'session') else None
-        event_dict['event_timestamp'] = event.timestamp if hasattr(event, 'timestamp') else None
-        event_dict['received_at'] = datetime.utcnow().isoformat()
-        
         # Send POST request to Cloud Function
         response = requests.post(
             CLOUD_FUNCTION_URL,
@@ -148,7 +132,7 @@ def send_event_to_cloud_function(event):
         
         response.raise_for_status()
         
-        print(f"Sent {event_subtype or 'Event'} event to Cloud Function (session: {event.session}, status: {response.status_code})")
+        print(f"Sent event to Cloud Function (status: {response.status_code}): {event_dict}")
         return response
         
     except requests.exceptions.RequestException as e:
@@ -186,15 +170,13 @@ def start_health_server():
     server.serve_forever()
 
 
-def run():
+def generate_auth():
     """
-    Main function to connect to Dynata event stream and process events.
+    Generate authentication credentials for Dynata event stream.
+    
+    Returns:
+        tuple: (expiration, access_key, signature)
     """
-    if event_stream_pb2 is None or event_stream_pb2_grpc is None:
-        raise ImportError("event_stream_pb2 modules are required. Generate them from proto files first.")
-    
-    print(f"Cloud Function endpoint: {CLOUD_FUNCTION_URL}")
-    
     # Generate authentication
     # Match the Node.js implementation: expiration is ISO string (RFC 3339)
     # expiration = new Date((Timestamp.now().seconds + 1000) * 1000).toISOString()
@@ -216,11 +198,21 @@ def run():
     if not access_key:
         raise ValueError("DYNATA_AUTH environment variable must be set")
     
+    return expiration, access_key, signature
+
+
+def connect_and_listen():
+    """
+    Connect to Dynata event stream and listen for events.
+    This function will run until the stream disconnects or an error occurs.
+    """
+    # Generate fresh authentication for each connection attempt
+    expiration, access_key, signature = generate_auth()
+    
     # Debug logging
     print(f"Generated signature for expiration: {expiration}")
     print(f"Using access_key: {access_key[:10]}...")
     print(f"Signature: {signature[:20]}...")
-    print(f"Signing string: {signing_string}")
     
     # The service uses TLS, but does not require client-side certificate configuration
     credentials = grpc.ssl_channel_credentials(
@@ -247,24 +239,79 @@ def run():
         
         print("Connecting to Dynata event stream...")
         
+        # Listen to events
+        events = client.Listen(auth)
+        
+        for event in events:
+            # Process and send each event
+            print(f"Received event - {event}")
+            send_event_to_cloud_function(event)
+
+
+def run():
+    """
+    Main function to connect to Dynata event stream and process events.
+    Includes retry logic with exponential backoff.
+    """
+    if event_stream_pb2 is None or event_stream_pb2_grpc is None:
+        raise ImportError("event_stream_pb2 modules are required. Generate them from proto files first.")
+    
+    print(f"Cloud Function endpoint: {CLOUD_FUNCTION_URL}")
+    
+    # Retry configuration
+    max_retry_delay = 300  # Maximum 5 minutes between retries
+    base_delay = 5  # Start with 5 seconds
+    retry_count = 0
+    
+    while True:
         try:
-            # Listen to events
-            events = client.Listen(auth)
-            
-            for event in events:
-                # Process and send each event
-                event_type = 'Start' if event.HasField('start') else ('End' if event.HasField('end') else 'Unknown')
-                print(f"Received {event_type} event - Session: {event.session}, Timestamp: {event.timestamp}")
-                send_event_to_cloud_function(event)
-                
-        except grpc.RpcError as e:
-            print(f"gRPC error: {e.code()} - {e.details()}")
-            raise
+            connect_and_listen()
+            # If we exit the function normally, break out of retry loop
+            print("Stream ended normally")
+            break
         except KeyboardInterrupt:
             print("Interrupted by user")
+            break
+            
+        except grpc.RpcError as e:
+            retry_count += 1
+            error_code = e.code()
+            error_details = e.details()
+            
+            print(f"gRPC error: {error_code} - {error_details}")
+            
+            # Don't retry on certain errors
+            if error_code == grpc.StatusCode.UNAUTHENTICATED:
+                print("Authentication error - check credentials")
+                # Still retry, but with longer delay
+                delay = min(base_delay * (2 ** retry_count), max_retry_delay)
+            elif error_code == grpc.StatusCode.PERMISSION_DENIED:
+                print("Permission denied - check access rights")
+                delay = min(base_delay * (2 ** retry_count), max_retry_delay)
+            elif error_code == grpc.StatusCode.INVALID_ARGUMENT:
+                print("Invalid argument - check configuration")
+                delay = min(base_delay * (2 ** retry_count), max_retry_delay)
+            else:
+                # For other errors (UNAVAILABLE, DEADLINE_EXCEEDED, etc.), retry with backoff
+                delay = min(base_delay * (2 ** retry_count), max_retry_delay)
+            
+            print(f"Retrying in {delay} seconds (attempt {retry_count})...")
+            time.sleep(delay)
+            
+        except KeyboardInterrupt:
+            print("Interrupted by user")
+            break
+            
         except Exception as e:
+            retry_count += 1
             print(f"Unexpected error: {e}")
-            raise
+            import traceback
+            traceback.print_exc()
+            
+            # Retry with exponential backoff
+            delay = min(base_delay * (2 ** retry_count), max_retry_delay)
+            print(f"Retrying in {delay} seconds (attempt {retry_count})...")
+            time.sleep(delay)
 
 
 if __name__ == '__main__':
