@@ -26,11 +26,6 @@ The easiest way to deploy is using the provided `deploy.sh` script:
 ./deploy.sh lancelot-fa22c
 ```
 
-Or with a custom region:
-```bash
-./deploy.sh lancelot-fa22c us-west1
-```
-
 The script will:
 - Build the Docker image from source
 - Deploy to Cloud Run

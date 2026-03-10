@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import grpc
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # These modules are generated via grpcio-tools from protos/event_stream.proto
 try:
@@ -112,43 +114,56 @@ def protobuf_to_dict(message):
     return result
 
 
+def _create_http_session():
+    """Create a requests session with retry logic for transient errors."""
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+# Reusable HTTP session with retry logic
+_http_session = _create_http_session()
+
+
 def send_event_to_cloud_function(event):
     """
     Send event to Cloud Function via POST request.
-    
+    Does NOT raise — failures are logged and skipped so the stream stays alive.
+
     Args:
         event: The event protobuf message (Event type)
     """
     try:
         # Convert event to dictionary
         event_dict = protobuf_to_dict(event)
-        
-        # Send POST request to Cloud Function
-        response = requests.post(
+
+        # Send POST request to Cloud Function (session handles retries)
+        response = _http_session.post(
             CLOUD_FUNCTION_URL,
             json=event_dict,
             headers={'Content-Type': 'application/json'},
             timeout=10
         )
-        
+
         response.raise_for_status()
-        
+
         print(f"Sent event to Cloud Function (status: {response.status_code}): {event_dict}")
         return response
-        
+
     except requests.exceptions.RequestException as e:
         print(f"Error sending event to Cloud Function: {e}")
         if hasattr(e, 'response') and e.response is not None:
             print(f"Response status: {e.response.status_code}")
             print(f"Response body: {e.response.text}")
-        import traceback
-        traceback.print_exc()
-        raise
     except Exception as e:
         print(f"Unexpected error sending event: {e}")
-        import traceback
-        traceback.print_exc()
-        raise
 
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -239,10 +254,11 @@ def connect_and_listen():
         
         # Listen to events
         events = client.Listen(auth)
-        
+
         for event in events:
-            # Process and send each event
-            print(f"Received event - {event}")
+            # Determine event type for logging
+            event_type = "Start" if event.HasField("start") else "End" if event.HasField("end") else "Unknown"
+            print(f"Received {event_type} event - Session: {event.session}, Timestamp: {event.timestamp}")
             send_event_to_cloud_function(event)
 
 
@@ -256,59 +272,43 @@ def run():
     
     print(f"Cloud Function endpoint: {CLOUD_FUNCTION_URL}")
     
-    # Retry configuration
-    max_retry_delay = 300  # Maximum 5 minutes between retries
-    base_delay = 5  # Start with 5 seconds
+    # Retry configuration — events are fire-and-forget (lost during disconnection),
+    # so reconnect quickly to minimize missed events.
+    max_retry_delay = 60  # Maximum 60 seconds between retries
+    base_delay = 1  # Start with 1 second
     retry_count = 0
-    
+
     while True:
         try:
             connect_and_listen()
-            # If we exit the function normally, break out of retry loop
-            print("Stream ended normally")
-            break
+            # Stream ended normally (server closed) — reconnect immediately
+            print("Stream ended normally, reconnecting...")
+            retry_count = 0
+            continue
+
         except KeyboardInterrupt:
             print("Interrupted by user")
             break
-            
+
         except grpc.RpcError as e:
-            retry_count += 1
             error_code = e.code()
             error_details = e.details()
-            
             print(f"gRPC error: {error_code} - {error_details}")
-            
-            # Don't retry on certain errors
-            if error_code == grpc.StatusCode.UNAUTHENTICATED:
-                print("Authentication error - check credentials")
-                # Still retry, but with longer delay
-                delay = min(base_delay * (2 ** retry_count), max_retry_delay)
-            elif error_code == grpc.StatusCode.PERMISSION_DENIED:
-                print("Permission denied - check access rights")
-                delay = min(base_delay * (2 ** retry_count), max_retry_delay)
-            elif error_code == grpc.StatusCode.INVALID_ARGUMENT:
-                print("Invalid argument - check configuration")
-                delay = min(base_delay * (2 ** retry_count), max_retry_delay)
-            else:
-                # For other errors (UNAVAILABLE, DEADLINE_EXCEEDED, etc.), retry with backoff
-                delay = min(base_delay * (2 ** retry_count), max_retry_delay)
-            
-            print(f"Retrying in {delay} seconds (attempt {retry_count})...")
+
+            if error_code in (grpc.StatusCode.UNAUTHENTICATED, grpc.StatusCode.PERMISSION_DENIED):
+                print("Authentication/permission error - check credentials")
+
+            retry_count += 1
+            delay = min(base_delay * (2 ** min(retry_count, 6)), max_retry_delay)
+            print(f"Reconnecting in {delay}s (attempt {retry_count})...")
             time.sleep(delay)
-            
-        except KeyboardInterrupt:
-            print("Interrupted by user")
-            break
-            
+
         except Exception as e:
             retry_count += 1
             print(f"Unexpected error: {e}")
-            import traceback
-            traceback.print_exc()
-            
-            # Retry with exponential backoff
-            delay = min(base_delay * (2 ** retry_count), max_retry_delay)
-            print(f"Retrying in {delay} seconds (attempt {retry_count})...")
+
+            delay = min(base_delay * (2 ** min(retry_count, 6)), max_retry_delay)
+            print(f"Reconnecting in {delay}s (attempt {retry_count})...")
             time.sleep(delay)
 
 
