@@ -239,7 +239,7 @@ def connect_and_listen():
         'events.rex.dynata.com',
         credentials,
         # Ensure that the channel uses client-side keepalives
-        options=(('grpc.keepalive_time_ms', 1000),)
+        options=(('grpc.keepalive_time_ms', 30000),)
     ) as channel:
         client = event_stream_pb2_grpc.EventStreamStub(channel)
         
