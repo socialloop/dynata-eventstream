@@ -27,7 +27,7 @@ DYNATA_SECRET = os.environ.get('DYNATA_SECRET') or 'r54zNnhXqMtb6RkxWPX17R5ypp0H
 DYNATA_ACCESS_KEY = os.environ.get('DYNATA_ACCESS_KEY') or 'E2ABCF45339FB9E093384A78E01A899F95BA3F22'
 
 # Cloud Function endpoint
-CLOUD_FUNCTION_URL = os.environ.get('CLOUD_FUNCTION_URL', 'https://us-central1-lancelot-fa22c.cloudfunctions.net/dynataEvent')
+CLOUD_FUNCTION_URL = os.environ.get('CLOUD_FUNCTION_URL', 'https://api.eurekasurveys.com/dynataEvent')
 
 # Cloud Run port
 PORT = int(os.environ.get('PORT', '8080'))

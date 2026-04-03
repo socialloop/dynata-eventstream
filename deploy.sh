@@ -4,7 +4,7 @@
 
 set -e
 
-PROJECT_ID=${1:-$GOOGLE_CLOUD_PROJECT}
+PROJECT_ID=${1:-${GOOGLE_CLOUD_PROJECT:-lancelot-fa22c}}
 REGION=${2:-us-central1}
 SERVICE_NAME="dynata-eventstream"
 
@@ -25,7 +25,7 @@ gcloud run deploy $SERVICE_NAME \
     --region $REGION \
     --project $PROJECT_ID \
     --allow-unauthenticated \
-    --set-env-vars "DYNATA_AUTH=${DYNATA_AUTH},DYNATA_SECRET=${DYNATA_SECRET},DYNATA_ACCESS_KEY=${DYNATA_ACCESS_KEY},CLOUD_FUNCTION_URL=${CLOUD_FUNCTION_URL:-https://us-central1-lancelot-fa22c.cloudfunctions.net/dynataEvent}" \
+    --set-env-vars "DYNATA_AUTH=${DYNATA_AUTH},DYNATA_SECRET=${DYNATA_SECRET},DYNATA_ACCESS_KEY=${DYNATA_ACCESS_KEY},CLOUD_FUNCTION_URL=${CLOUD_FUNCTION_URL:-https://api.eurekasurveys.com/dynataEvent}" \
     --memory 512Mi \
     --cpu 1 \
     --timeout 3600 \
