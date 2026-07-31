@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import json
 import logging
 import os
 import signal
@@ -25,9 +26,25 @@ except ImportError:
     event_stream_pb2 = None
     event_stream_pb2_grpc = None
 
+class _CloudRunFormatter(logging.Formatter):
+    """Structured JSON logs on stdout so Cloud Logging parses severity.
+
+    Plain text on stderr is ingested as ERROR by Cloud Run, which made every
+    routine log line show up (and get billed) as an error.
+    """
+
+    def format(self, record):
+        message = record.getMessage()
+        if record.exc_info:
+            message += "\n" + self.formatException(record.exc_info)
+        return json.dumps({"severity": record.levelname, "message": message})
+
+
+_handler = logging.StreamHandler(sys.stdout)
+_handler.setFormatter(_CloudRunFormatter())
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
+    level=os.environ.get("LOG_LEVEL", "INFO"),
+    handlers=[_handler],
 )
 logger = logging.getLogger("dynata-eventstream")
 
@@ -146,7 +163,7 @@ def send_event_to_cloud_function(event):
             timeout=10
         )
         response.raise_for_status()
-        logger.info("Forwarded event (session=%s, status=%s)", event.session, response.status_code)
+        logger.debug("Forwarded event (session=%s, status=%s)", event.session, response.status_code)
 
     except requests.exceptions.RequestException as e:
         logger.error("Failed to forward event (session=%s): %s", event.session, e)
@@ -246,7 +263,7 @@ def connect_and_listen():
         try:
             for event in events:
                 event_type = "Start" if event.HasField("start") else "End" if event.HasField("end") else "Unknown"
-                logger.info("Received %s event (session=%s, timestamp=%s)", event_type, event.session, event.timestamp)
+                logger.debug("Received %s event (session=%s, timestamp=%s)", event_type, event.session, event.timestamp)
                 send_event_to_cloud_function(event)
         finally:
             _stream_state.connected = False
