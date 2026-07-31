@@ -1,6 +1,26 @@
-# Dynata Event Stream to Firestore
+# Dynata Event Stream Forwarder
 
-This service connects to the Dynata event stream via gRPC and writes events to Firestore.
+Connects to the Dynata respondent event broadcaster (gRPC server stream at
+`events.rex.dynata.com`, docs: https://docs.rex.dynata.com/broadcaster/) and
+forwards each event via HTTP POST to a Cloud Function.
+
+Note: the stream is **not durable** — events that occur while disconnected are
+lost. The service runs with `min-instances=1` and reconnects aggressively.
+
+## Configuration
+
+All via environment variables (no defaults for secrets — the service fails
+fast if they are missing):
+
+- `DYNATA_AUTH` (required): Dynata access key
+- `DYNATA_SECRET` (required): Dynata secret key
+- `CLOUD_FUNCTION_URL` (required): endpoint that receives forwarded events
+- `UNHEALTHY_AFTER_SECONDS` (optional, default 300): how long the stream may be
+  down before `/healthz` reports 503
+
+In production the Dynata credentials come from Secret Manager
+(`dynata-auth`, `dynata-secret`) — see `deploy.sh`. Never commit credential
+values to this repo.
 
 ## Setup
 
@@ -9,59 +29,39 @@ This service connects to the Dynata event stream via gRPC and writes events to F
 pip install -r requirements.txt
 ```
 
-2. Set up environment variables (defaults are set but can be overridden):
-   - `DYNATA_AUTH`: Dynata authentication key (default: `E2ABCF45339FB9E093384A78E01A899F95BA3F22`)
-   - `DYNATA_SECRET`: Dynata secret key (default: `r54zNnhXqMtb6RkxWPX17R5ypp0HlDPL`)
-   - `DYNATA_ACCESS_KEY`: Your Dynata access key (default: `E2ABCF45339FB9E093384A78E01A899F95BA3F22`)
-   - `GOOGLE_CLOUD_PROJECT`: Your GCP project ID (default: `lancelot-fa22c`)
-   - `FIRESTORE_COLLECTION`: Firestore collection name (default: `dynata_events`)
-
-3. Generate protobuf files (the proto file is already in `protos/event_stream.proto`):
+2. Generate protobuf files (the proto file is in `protos/event_stream.proto`):
 ```bash
 ./generate_protos.sh
 ```
 
-Or manually:
-```bash
-python3 -m grpc_tools.protoc \
-    --proto_path=./protos \
-    --python_out=./src \
-    --grpc_python_out=./src \
-    ./protos/event_stream.proto
-```
-
-Note: The Dockerfile will automatically generate these during the build process.
+The Dockerfile generates these automatically during the build.
 
 ## Local Development
 
-Run the service locally:
 ```bash
+export DYNATA_AUTH=...
+export DYNATA_SECRET=...
+export CLOUD_FUNCTION_URL=...   # point at a dev endpoint, not production
 python src/main.py
 ```
 
 ## Deployment to Cloud Run
 
-1. Build and push the Docker image:
 ```bash
-gcloud builds submit --tag gcr.io/[PROJECT-ID]/dynata-eventstream
+./deploy.sh [PROJECT_ID] [REGION]
 ```
 
-2. Deploy to Cloud Run:
+This builds from source and deploys with secrets mounted from Secret Manager.
+To rotate credentials, add new secret versions and redeploy:
+
 ```bash
-gcloud run deploy dynata-eventstream \
-    --image gcr.io/[PROJECT-ID]/dynata-eventstream \
-    --platform managed \
-    --region us-central1 \
-    --set-env-vars DYNATA_AUTH=[value],DYNATA_SECRET=[value],DYNATA_ACCESS_KEY=[value],GOOGLE_CLOUD_PROJECT=[value] \
-    --allow-unauthenticated
+printf '%s' "NEW_VALUE" | gcloud secrets versions add dynata-auth --data-file=-
+printf '%s' "NEW_VALUE" | gcloud secrets versions add dynata-secret --data-file=-
+./deploy.sh
 ```
 
-Or use the Cloud Run service account with Firestore permissions:
-```bash
-gcloud run deploy dynata-eventstream \
-    --image gcr.io/[PROJECT-ID]/dynata-eventstream \
-    --platform managed \
-    --region us-central1 \
-    --set-env-vars DYNATA_AUTH=[value],DYNATA_SECRET=[value],DYNATA_ACCESS_KEY=[value] \
-    --service-account [SERVICE-ACCOUNT-EMAIL]
-```
+## Health endpoints
+
+- `/` — always 200 while the process is up (startup probe)
+- `/healthz` — 503 if the stream has been disconnected longer than
+  `UNHEALTHY_AFTER_SECONDS` (usable as a liveness probe)

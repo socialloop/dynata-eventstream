@@ -1,6 +1,10 @@
 #!/bin/bash
 
 # Deploy Dynata Event Stream service to Cloud Run
+#
+# Credentials come from Secret Manager (secrets: dynata-auth, dynata-secret).
+# To rotate: gcloud secrets versions add dynata-auth --data-file=- <<< "NEW_VALUE"
+# then redeploy (or restart the service).
 
 set -e
 
@@ -24,8 +28,9 @@ gcloud run deploy $SERVICE_NAME \
     --platform managed \
     --region $REGION \
     --project $PROJECT_ID \
-    --allow-unauthenticated \
-    --set-env-vars "DYNATA_AUTH=${DYNATA_AUTH},DYNATA_SECRET=${DYNATA_SECRET},DYNATA_ACCESS_KEY=${DYNATA_ACCESS_KEY},CLOUD_FUNCTION_URL=${CLOUD_FUNCTION_URL:-https://api.eurekasurveys.com/dynataEvent}" \
+    --no-allow-unauthenticated \
+    --set-secrets "DYNATA_AUTH=dynata-auth:latest,DYNATA_SECRET=dynata-secret:latest" \
+    --set-env-vars "CLOUD_FUNCTION_URL=${CLOUD_FUNCTION_URL:-https://api.eurekasurveys.com/dynataEvent}" \
     --memory 512Mi \
     --cpu 1 \
     --timeout 3600 \
@@ -34,4 +39,3 @@ gcloud run deploy $SERVICE_NAME \
     --no-cpu-throttling
 
 echo "Deployment complete!"
-

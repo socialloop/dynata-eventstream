@@ -1,12 +1,17 @@
 import hashlib
 import hmac
+import logging
 import os
-import time
+import signal
+import sys
 import threading
+import time
 from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
+
 import grpc
 import requests
+from google.protobuf.json_format import MessageToDict
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -20,35 +25,61 @@ except ImportError:
     event_stream_pb2 = None
     event_stream_pb2_grpc = None
 
-# Dynata authentication constants
-# Get env vars, handling empty strings by falling back to defaults
-DYNATA_AUTH = os.environ.get('DYNATA_AUTH') or 'E2ABCF45339FB9E093384A78E01A899F95BA3F22'
-DYNATA_SECRET = os.environ.get('DYNATA_SECRET') or 'r54zNnhXqMtb6RkxWPX17R5ypp0HlDPL'
-DYNATA_ACCESS_KEY = os.environ.get('DYNATA_ACCESS_KEY') or 'E2ABCF45339FB9E093384A78E01A899F95BA3F22'
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+logger = logging.getLogger("dynata-eventstream")
 
-# Cloud Function endpoint
-CLOUD_FUNCTION_URL = os.environ.get('CLOUD_FUNCTION_URL', 'https://api.eurekasurveys.com/dynataEvent')
+
+def _require_env(name: str) -> str:
+    """Read a required environment variable, failing fast if missing/empty."""
+    value = os.environ.get(name)
+    if not value:
+        raise RuntimeError(f"Required environment variable {name} is not set")
+    return value
+
+
+# Dynata authentication credentials (no defaults — fail fast if unset)
+DYNATA_AUTH = _require_env('DYNATA_AUTH')
+DYNATA_SECRET = _require_env('DYNATA_SECRET')
+
+# Cloud Function endpoint (required — no production default so local runs
+# can't silently forward to prod)
+CLOUD_FUNCTION_URL = _require_env('CLOUD_FUNCTION_URL')
 
 # Cloud Run port
 PORT = int(os.environ.get('PORT', '8080'))
+
+# Consider the service unhealthy if the stream has been down this long
+UNHEALTHY_AFTER_SECONDS = int(os.environ.get('UNHEALTHY_AFTER_SECONDS', '300'))
+
+# Stream health state, shared with the health check server.
+# Simple attribute assignments are atomic under the GIL.
+class _StreamState:
+    connected = False
+    disconnected_since = time.monotonic()
+
+
+_stream_state = _StreamState()
 
 
 def get_dynata_signature(signing_string: str, access_key: str, secret_key: str, expiration: str) -> str:
     """
     Generate Dynata signature for authentication.
-    
+
     Per documentation: https://docs.rex.dynata.com/rex/security/
     Steps:
     1. HMAC-SHA256(expiration, signing_string)
     2. HMAC-SHA256(access_key, first)
     3. HMAC-SHA256(secret_key, second)
-    
+
     Args:
         signing_string: The signing string (SHA256 hash of params for API requests)
         access_key: The access key
         secret_key: The secret key
         expiration: Expiration timestamp as string (RFC 3339)
-        
+
     Returns:
         Hexadecimal signature string
     """
@@ -58,60 +89,22 @@ def get_dynata_signature(signing_string: str, access_key: str, secret_key: str, 
         signing_string.encode('utf-8'),
         hashlib.sha256
     ).hexdigest()
-    
+
     # Step 2: HMAC-SHA256 with access_key as key and first as message
     second = hmac.new(
         access_key.encode('utf-8'),
         first.encode('utf-8'),
         hashlib.sha256
     ).hexdigest()
-    
+
     # Step 3: HMAC-SHA256 with secret_key as key and second as message
     final = hmac.new(
         secret_key.encode('utf-8'),
         second.encode('utf-8'),
         hashlib.sha256
     ).hexdigest()
-    
+
     return final
-
-
-def protobuf_to_dict(message):
-    """
-    Convert a protobuf message to a dictionary.
-    
-    Args:
-        message: Protobuf message object
-        
-    Returns:
-        Dictionary representation of the message
-    """
-    try:
-        # Try using MessageToDict if available (from google.protobuf.json_format)
-        from google.protobuf.json_format import MessageToDict
-        return MessageToDict(message, preserving_proto_field_name=True)
-    except ImportError:
-        pass
-    
-    # Fallback: manual conversion
-    result = {}
-    if hasattr(message, 'DESCRIPTOR'):
-        for field in message.DESCRIPTOR.fields:
-            field_name = field.name
-            value = getattr(message, field_name, None)
-            if value is not None:
-                # Handle nested messages
-                if hasattr(value, 'DESCRIPTOR'):
-                    result[field_name] = protobuf_to_dict(value)
-                # Handle repeated fields
-                elif isinstance(value, (list, tuple)):
-                    result[field_name] = [
-                        protobuf_to_dict(item) if hasattr(item, 'DESCRIPTOR') else item
-                        for item in value
-                    ]
-                else:
-                    result[field_name] = value
-    return result
 
 
 def _create_http_session():
@@ -121,6 +114,9 @@ def _create_http_session():
         total=3,
         backoff_factor=1,
         status_forcelist=[429, 500, 502, 503, 504],
+        # Default allowed_methods excludes POST — include it explicitly so the
+        # status_forcelist retries actually apply to our event forwarding.
+        allowed_methods=frozenset({"POST"}),
     )
     adapter = HTTPAdapter(max_retries=retry_strategy)
     session.mount("https://", adapter)
@@ -140,40 +136,47 @@ def send_event_to_cloud_function(event):
     Args:
         event: The event protobuf message (Event type)
     """
+    event_dict = MessageToDict(event, preserving_proto_field_name=True)
     try:
-        # Convert event to dictionary
-        event_dict = protobuf_to_dict(event)
-
-        # Send POST request to Cloud Function (session handles retries)
+        # Send POST request to Cloud Function (session retries 429/5xx)
         response = _http_session.post(
             CLOUD_FUNCTION_URL,
             json=event_dict,
             headers={'Content-Type': 'application/json'},
             timeout=10
         )
-
         response.raise_for_status()
-
-        print(f"Sent event to Cloud Function (status: {response.status_code}): {event_dict}")
-        return response
+        logger.info("Forwarded event (session=%s, status=%s)", event.session, response.status_code)
 
     except requests.exceptions.RequestException as e:
-        print(f"Error sending event to Cloud Function: {e}")
-        if hasattr(e, 'response') and e.response is not None:
-            print(f"Response status: {e.response.status_code}")
-            print(f"Response body: {e.response.text}")
-    except Exception as e:
-        print(f"Unexpected error sending event: {e}")
+        logger.error("Failed to forward event (session=%s): %s", event.session, e)
+        if getattr(e, 'response', None) is not None:
+            logger.error("Response status: %s, body: %.500s", e.response.status_code, e.response.text)
+    except Exception:
+        logger.exception("Unexpected error forwarding event (session=%s)", event.session)
 
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    """Simple HTTP handler for Cloud Run health checks"""
+    """HTTP handler for Cloud Run health checks."""
+
     def do_GET(self):
-        self.send_response(200)
+        if self.path == '/healthz':
+            # Liveness: unhealthy if the stream has been down too long
+            down_for = 0 if _stream_state.connected else time.monotonic() - _stream_state.disconnected_since
+            if down_for > UNHEALTHY_AFTER_SECONDS:
+                self.send_response(503)
+                body = f'stream down for {int(down_for)}s'.encode()
+            else:
+                self.send_response(200)
+                body = b'OK'
+        else:
+            # Startup/readiness: process is up
+            self.send_response(200)
+            body = b'OK'
         self.send_header('Content-type', 'text/plain')
         self.end_headers()
-        self.wfile.write(b'OK')
-    
+        self.wfile.write(body)
+
     def log_message(self, format, *args):
         # Suppress default logging
         pass
@@ -182,36 +185,28 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
 def start_health_server():
     """Start HTTP server for Cloud Run health checks"""
     server = HTTPServer(('', PORT), HealthCheckHandler)
-    print(f"Health check server listening on port {PORT}")
+    logger.info("Health check server listening on port %s", PORT)
     server.serve_forever()
 
 
 def generate_auth():
     """
     Generate authentication credentials for Dynata event stream.
-    
+
     Returns:
         tuple: (expiration, access_key, signature)
     """
-    # Generate authentication
-    # Match the Node.js implementation: expiration is ISO string (RFC 3339)
-    # expiration = new Date((Timestamp.now().seconds + 1000) * 1000).toISOString()
-    expiration_time = time.time() + 1000  # 1000 seconds from now (matching Node.js)
+    # Expiration is an ISO string (RFC 3339), 1000 seconds from now
+    expiration_time = time.time() + 1000
     expiration = datetime.fromtimestamp(expiration_time, tz=timezone.utc).isoformat()
-    
-    # According to broadcaster documentation: Use "respondent.events" as the signing string
-    # Per security docs: For API requests, signing_string is SHA256 hash of the request body
-    # For the event stream, we use "respondent.events" as the literal string
+
+    # Per broadcaster documentation: "respondent.events" is the signing string
     signing_string = "respondent.events"
-    
+
     # Per security documentation: sign(signing_string, access_key, secret_key, expiration)
     signature = get_dynata_signature(signing_string, DYNATA_AUTH, DYNATA_SECRET, expiration)
-    
-    # In Node.js, dynata-access-key uses DYNATA_AUTH
-    # The access_key field should match what was used for signature creation
-    access_key = DYNATA_AUTH
-    
-    return expiration, access_key, signature
+
+    return expiration, DYNATA_AUTH, signature
 
 
 def connect_and_listen():
@@ -221,19 +216,11 @@ def connect_and_listen():
     """
     # Generate fresh authentication for each connection attempt
     expiration, access_key, signature = generate_auth()
-    
-    # Debug logging
-    print(f"Generated signature for expiration: {expiration}")
-    print(f"Using access_key: {access_key[:10]}...")
-    print(f"Signature: {signature[:20]}...")
-    
+    logger.info("Connecting to Dynata event stream (auth expiration: %s)", expiration)
+
     # The service uses TLS, but does not require client-side certificate configuration
-    credentials = grpc.ssl_channel_credentials(
-        root_certificates=None,
-        private_key=None,
-        certificate_chain=None
-    )
-    
+    credentials = grpc.ssl_channel_credentials()
+
     # Connect to Dynata event stream
     with grpc.secure_channel(
         'events.rex.dynata.com',
@@ -242,24 +229,28 @@ def connect_and_listen():
         options=(('grpc.keepalive_time_ms', 30000),)
     ) as channel:
         client = event_stream_pb2_grpc.EventStreamStub(channel)
-        
-        # Create auth message
+
         auth = event_stream_pb2.Auth(
             expiration=expiration,
             access_key=access_key,
             signature=signature
         )
-        
-        print("Connecting to Dynata event stream...")
-        
-        # Listen to events
-        events = client.Listen(auth)
 
-        for event in events:
-            # Determine event type for logging
-            event_type = "Start" if event.HasField("start") else "End" if event.HasField("end") else "Unknown"
-            print(f"Received {event_type} event - Session: {event.session}, Timestamp: {event.timestamp}")
-            send_event_to_cloud_function(event)
+        # Wait for the channel to be ready so health state reflects actual
+        # connectivity (a quiet stream is still a healthy stream)
+        grpc.channel_ready_future(channel).result(timeout=30)
+        _stream_state.connected = True
+        logger.info("Channel ready, listening for events")
+
+        events = client.Listen(auth)
+        try:
+            for event in events:
+                event_type = "Start" if event.HasField("start") else "End" if event.HasField("end") else "Unknown"
+                logger.info("Received %s event (session=%s, timestamp=%s)", event_type, event.session, event.timestamp)
+                send_event_to_cloud_function(event)
+        finally:
+            _stream_state.connected = False
+            _stream_state.disconnected_since = time.monotonic()
 
 
 def run():
@@ -269,54 +260,61 @@ def run():
     """
     if event_stream_pb2 is None or event_stream_pb2_grpc is None:
         raise ImportError("event_stream_pb2 modules are required. Generate them from proto files first.")
-    
-    print(f"Cloud Function endpoint: {CLOUD_FUNCTION_URL}")
-    
-    # Retry configuration — events are fire-and-forget (lost during disconnection),
-    # so reconnect quickly to minimize missed events.
-    max_retry_delay = 60  # Maximum 60 seconds between retries
-    base_delay = 1  # Start with 1 second
+
+    logger.info("Cloud Function endpoint: %s", CLOUD_FUNCTION_URL)
+
+    # Retry configuration — the stream is not durable (events during
+    # disconnection are lost forever), so reconnect as fast as possible.
+    # Backoff only guards against tight failure loops (e.g. bad credentials).
+    max_retry_delay = 30
     retry_count = 0
+    # A connection that survived this long counts as healthy: reset backoff
+    healthy_connection_seconds = 60
 
     while True:
+        connected_at = time.monotonic()
         try:
             connect_and_listen()
             # Stream ended normally (server closed) — reconnect immediately
-            print("Stream ended normally, reconnecting...")
+            logger.info("Stream ended normally, reconnecting...")
             retry_count = 0
             continue
 
-        except KeyboardInterrupt:
-            print("Interrupted by user")
+        except (KeyboardInterrupt, SystemExit):
+            logger.info("Shutting down")
             break
 
         except grpc.RpcError as e:
-            error_code = e.code()
-            error_details = e.details()
-            print(f"gRPC error: {error_code} - {error_details}")
+            logger.error("gRPC error: %s - %s", e.code(), e.details())
+            if e.code() in (grpc.StatusCode.UNAUTHENTICATED, grpc.StatusCode.PERMISSION_DENIED):
+                logger.error("Authentication/permission error - check credentials")
 
-            if error_code in (grpc.StatusCode.UNAUTHENTICATED, grpc.StatusCode.PERMISSION_DENIED):
-                print("Authentication/permission error - check credentials")
+        except Exception:
+            logger.exception("Unexpected error in stream loop")
 
-            retry_count += 1
-            delay = min(base_delay * (2 ** min(retry_count, 6)), max_retry_delay)
-            print(f"Reconnecting in {delay}s (attempt {retry_count})...")
-            time.sleep(delay)
+        # A long-lived connection that later failed is not a retry storm —
+        # reset the counter so transient blips reconnect quickly.
+        if time.monotonic() - connected_at > healthy_connection_seconds:
+            retry_count = 0
 
-        except Exception as e:
-            retry_count += 1
-            print(f"Unexpected error: {e}")
+        retry_count += 1
+        delay = min(2 ** (retry_count - 1), max_retry_delay)
+        logger.info("Reconnecting in %ss (attempt %s)...", delay, retry_count)
+        time.sleep(delay)
 
-            delay = min(base_delay * (2 ** min(retry_count, 6)), max_retry_delay)
-            print(f"Reconnecting in {delay}s (attempt {retry_count})...")
-            time.sleep(delay)
+
+def _handle_sigterm(signum, frame):
+    """Cloud Run sends SIGTERM before shutdown — exit cleanly."""
+    logger.info("Received SIGTERM")
+    raise SystemExit(0)
 
 
 if __name__ == '__main__':
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+
     # Start health check server in a separate thread
     health_thread = threading.Thread(target=start_health_server, daemon=True)
     health_thread.start()
-    
+
     # Run the main event stream handler
     run()
-
