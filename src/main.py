@@ -3,6 +3,7 @@ import hmac
 import json
 import logging
 import os
+import queue
 import signal
 import sys
 import threading
@@ -70,6 +71,18 @@ PORT = int(os.environ.get('PORT', '8080'))
 
 # Consider the service unhealthy if the stream has been down this long
 UNHEALTHY_AFTER_SECONDS = int(os.environ.get('UNHEALTHY_AFTER_SECONDS', '300'))
+
+# Forwarding workers. Each worker owns a queue and an HTTP session and posts
+# sequentially; events are sharded by session so a session's end is always
+# posted after its start (the backend drops an end whose start it never saw).
+# A single sequential poster (~130ms/post) fell to half the daytime arrival
+# rate, built 60+ minutes of lag, and lost the whole backlog on every stream
+# reconnect.
+WORKER_COUNT = int(os.environ.get('WORKER_COUNT', '16'))
+QUEUE_MAXSIZE = int(os.environ.get('QUEUE_MAXSIZE', '1000'))
+QUEUE_DEPTH_LOG_SECONDS = 60
+# Cloud Run allows 10s after SIGTERM; spend most of it posting queued events
+SHUTDOWN_DRAIN_SECONDS = 8
 
 # Stream health state, shared with the health check server.
 # Simple attribute assignments are atomic under the GIL.
@@ -141,22 +154,19 @@ def _create_http_session():
     return session
 
 
-# Reusable HTTP session with retry logic
-_http_session = _create_http_session()
-
-
-def send_event_to_cloud_function(event):
+def send_event_to_cloud_function(session, event):
     """
     Send event to Cloud Function via POST request.
     Does NOT raise — failures are logged and skipped so the stream stays alive.
 
     Args:
+        session: requests.Session owned by the calling worker
         event: The event protobuf message (Event type)
     """
     event_dict = MessageToDict(event, preserving_proto_field_name=True)
     try:
         # Send POST request to Cloud Function (session retries 429/5xx)
-        response = _http_session.post(
+        response = session.post(
             CLOUD_FUNCTION_URL,
             json=event_dict,
             headers={'Content-Type': 'application/json'},
@@ -171,6 +181,57 @@ def send_event_to_cloud_function(event):
             logger.error("Response status: %s, body: %.500s", e.response.status_code, e.response.text)
     except Exception:
         logger.exception("Unexpected error forwarding event (session=%s)", event.session)
+
+
+# One bounded queue per worker; the listener blocks when a shard is full
+_queues = [queue.Queue(maxsize=QUEUE_MAXSIZE) for _ in range(WORKER_COUNT)]
+
+
+def _worker(q):
+    """Drain one shard's queue forever, posting events in order."""
+    session = _create_http_session()
+    while True:
+        event = q.get()
+        send_event_to_cloud_function(session, event)
+        q.task_done()
+
+
+def _shard_for(session_id: str) -> int:
+    """Map a Dynata session id to a worker so all its events post in order."""
+    return hash(session_id) % WORKER_COUNT
+
+
+def enqueue_event(event):
+    """Hand an event to its shard's worker, blocking if that shard is full."""
+    _queues[_shard_for(event.session)].put(event)
+
+
+def _log_queue_depth():
+    """Periodic queue-depth log so forwarding lag is visible in Cloud Logging."""
+    while True:
+        time.sleep(QUEUE_DEPTH_LOG_SECONDS)
+        depths = [q.qsize() for q in _queues]
+        logger.info("Forwarding queue depth: total=%s max_shard=%s", sum(depths), max(depths))
+
+
+def drain_queues(timeout: float):
+    """Wait up to `timeout` seconds for the workers to post what is queued."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        pending = sum(q.unfinished_tasks for q in _queues)
+        if pending == 0:
+            logger.info("Forwarding queues drained")
+            return
+        time.sleep(0.1)
+    logger.warning("Shutdown with %s events still queued", sum(q.unfinished_tasks for q in _queues))
+
+
+def start_workers():
+    """Start the forwarding workers and the queue-depth logger."""
+    for q in _queues:
+        threading.Thread(target=_worker, args=(q,), daemon=True).start()
+    threading.Thread(target=_log_queue_depth, daemon=True).start()
+    logger.info("Started %s forwarding workers (queue maxsize %s)", WORKER_COUNT, QUEUE_MAXSIZE)
 
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -264,7 +325,7 @@ def connect_and_listen():
             for event in events:
                 event_type = "Start" if event.HasField("start") else "End" if event.HasField("end") else "Unknown"
                 logger.debug("Received %s event (session=%s, timestamp=%s)", event_type, event.session, event.timestamp)
-                send_event_to_cloud_function(event)
+                enqueue_event(event)
         finally:
             _stream_state.connected = False
             _stream_state.disconnected_since = time.monotonic()
@@ -314,8 +375,9 @@ def run():
         if time.monotonic() - connected_at > healthy_connection_seconds:
             retry_count = 0
 
+        # Every second disconnected loses events, so the first retry is immediate
         retry_count += 1
-        delay = min(2 ** (retry_count - 1), max_retry_delay)
+        delay = 0 if retry_count == 1 else min(2 ** (retry_count - 2), max_retry_delay)
         logger.info("Reconnecting in %ss (attempt %s)...", delay, retry_count)
         time.sleep(delay)
 
@@ -333,5 +395,12 @@ if __name__ == '__main__':
     health_thread = threading.Thread(target=start_health_server, daemon=True)
     health_thread.start()
 
-    # Run the main event stream handler
-    run()
+    # Start the forwarding workers before any event can arrive
+    start_workers()
+
+    # Run the main event stream handler until SIGTERM
+    try:
+        run()
+    finally:
+        # The stream is closed, so nothing new arrives: post what is still queued
+        drain_queues(SHUTDOWN_DRAIN_SECONDS)

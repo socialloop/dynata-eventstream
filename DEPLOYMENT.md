@@ -59,30 +59,6 @@ gcloud run deploy dynata-eventstream \
 
 **Note:** `--no-cpu-throttling` ensures the service stays running continuously (important for streaming).
 
-### Method 3: Using Cloud Build
-
-Deploy using Cloud Build with the `cloudbuild.yaml`:
-
-```bash
-gcloud builds submit --config cloudbuild.yaml
-```
-
-Then manually deploy the image:
-```bash
-gcloud run deploy dynata-eventstream \
-    --image gcr.io/lancelot-fa22c/dynata-eventstream \
-    --platform managed \
-    --region us-central1 \
-    --project lancelot-fa22c \
-    --allow-unauthenticated \
-    --set-env-vars "DYNATA_AUTH=...,DYNATA_SECRET=...,DYNATA_ACCESS_KEY=...,CLOUD_FUNCTION_URL=..." \
-    --memory 512Mi \
-    --cpu 1 \
-    --timeout 3600 \
-    --max-instances 1 \
-    --no-cpu-throttling
-```
-
 ## Important Configuration
 
 ### CPU Throttling

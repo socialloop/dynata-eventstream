@@ -17,6 +17,10 @@ fast if they are missing):
 - `CLOUD_FUNCTION_URL` (required): endpoint that receives forwarded events
 - `UNHEALTHY_AFTER_SECONDS` (optional, default 300): how long the stream may be
   down before `/healthz` reports 503
+- `WORKER_COUNT` (optional, default 16): forwarding workers; events are sharded
+  by session so each session's events post in order
+- `QUEUE_MAXSIZE` (optional, default 1000): per-worker queue bound; the listener
+  blocks when a shard is full. Queue depth is logged every 60s.
 
 In production the Dynata credentials come from Secret Manager
 (`dynata-auth`, `dynata-secret`) — see `deploy.sh`. Never commit credential
